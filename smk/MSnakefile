@@ -1,0 +1,131 @@
+#configfile: "config.yaml"
+import gzip, os
+from Bio.SeqIO.QualityIO import FastqGeneralIterator as fqi
+
+### PARSE THE INPUT TEMPLATES
+samples = {}
+for line in open(config["sample_list"]).readlines():
+    runs = line.strip().split("\t")[1].split(",")
+    for run in runs:
+        samples[run] = runs
+
+rule all:
+   input:
+        expand("metabat/{sample}_bins/done", sample=samples.keys()),
+
+rule download_individual_reads:
+    output:
+        fwd = "reads/{sample}/{sample}_1.fastq.gz",
+        rev = "reads/{sample}/{sample}_2.fastq.gz"
+    threads: config["maxthreads"]
+    log: "logs/download/{sample}.log"
+    run:
+        for run in samples.keys():
+            command = "par-fastq-dump --sra-id %s --threads {threads} --outdir \
+                reads/%s --split-files --gzip 2> {log}" %(wildcards.sample, wildcards.sample)
+            shell(command)
+
+rule repair_reads:
+    input:
+        fwd = "reads/{sample}/{sample}_1.fastq.gz",
+        rev = "reads/{sample}/{sample}_2.fastq.gz"
+    output:
+        fwd = "repaired_reads/{sample}_1.fastq.gz",
+        rev = "repaired_reads/{sample}_2.fastq.gz"
+    log: "logs/repair/{sample}.log"
+    shell:
+        """
+        repair.sh in1={input.fwd} in2={input.rev} \
+            out1={output.fwd} out2={output.rev} repair
+        """
+
+rule trim_reads:
+    input:
+        fwd = "repaired_reads/{sample}_1.fastq.gz",
+        rev = "repaired_reads/{sample}_2.fastq.gz"
+    output:
+        fwd = "trimmed_reads/{sample}_1.fastq.gz",
+        rev = "trimmed_reads/{sample}_2.fastq.gz"
+    threads: config["maxthreads"]
+    log: "logs/trim/{sample}.log"
+    shell:
+        """
+        bbduk.sh in1={input.fwd} in2={input.rev} \
+            out1={output.fwd} out2={output.rev} \
+            threads={threads} ref=adapters ktrim=r \
+            k=23 mink=11 hdist=1 tbo \
+            qtrim=r trimq=25 minlen=20
+        """
+
+rule assemble_reads:
+    input:
+        fwd = "trimmed_reads/{sample}_1.fastq.gz",
+        rev = "trimmed_reads/{sample}_2.fastq.gz"
+    output:
+        raw_scafs = "assembly/{sample}/{sample}.contigs.fa",
+        renamed_scafs = "assembly/{sample}/{sample}.renamed.contigs.fa"
+    threads: config["maxthreads"]
+    log: "logs/assemble/{sample}.log"
+    shell:
+        """
+        rm -r assembly/{wildcards.sample}
+        megahit -1 {input.fwd} -2 {input.rev} -o assembly/{wildcards.sample} \
+         --continue --out-prefix {wildcards.sample} -t {threads}
+        rename_assembly.py {output.raw_scafs}
+        """
+
+rule build_index:
+    input:
+        assembly = "assembly/{sample}/{sample}.renamed.contigs.fa"
+    output:
+        idx = "assembly/{sample}/indexed"
+    log: "logs/build/{sample}.log"
+    threads: config["maxthreads"]
+    run:
+        ipath = "assembly/%s/%s.idx" %(wildcards.sample, wildcards.sample)
+        btb = "bowtie2-build --threads {threads} {input.assembly} %s" %(ipath)
+        shell(btb)
+        shell("touch {output.idx}")
+
+rule map_reads:
+    input:
+        idx = "assembly/{sample}/indexed",
+        fwd = "trimmed_reads/{run}_1.fastq.gz",
+        rev = "trimmed_reads/{run}_2.fastq.gz"
+    output:
+        bam = "mapping/{sample}_{run}.bam",
+        sorted_bam = "mapping/{sample}_{run}.sorted.bam"
+    log: "logs/mapping/{sample}_{run}.log"
+    threads: config["maxthreads"]
+    run:
+        ipath = "assembly/%s/%s.idx" %(wildcards.sample, wildcards.sample)
+        cmd = "bowtie2 -x %s -1 {input.fwd} -2 {input.rev} -p {threads} | shrinksam | samtools view -S -b > {output.bam}" %(ipath)
+        shell(cmd)
+        shell("samtools sort --threads {threads} {output.bam} > {output.sorted_bam}")
+        shell("samtools index -@ {threads} {output.sorted_bam}")
+
+rule build_coverage_table:
+    input:
+        bams = lambda wildcards: expand("mapping/{sample}_{run}.sorted.bam",
+            sample=wildcards.sample, run=samples[wildcards.sample])
+    output:
+        depth_table = "metabat/{sample}.txt"
+    log: "logs/depth/{sample}.log"
+    threads: config["maxthreads"]
+    run:
+        shell("jgi_summarize_bam_contig_depths --outputDepth %s %s" %(output.depth_table, " ".join(input.bams)))
+
+rule run_metabat:
+    input:
+        assembly = "assembly/{sample}/{sample}.renamed.contigs.fa",
+        depth = "metabat/{sample}.txt"
+    output:
+        done = "metabat/{sample}_bins/done"
+    log: "logs/metabat/{sample}.log"
+    threads: config["maxthreads"]
+    run:
+        outdir = "metabat/%s_bins/" %(wildcards.sample)
+        cmd = "metabat2 -t {threads} -m 1500 -i %s -a %s -o %s" %(input.assembly, \
+            input.depth, outdir + wildcards.sample)
+        shell(cmd)
+        shell("touch %s" %(output.done))
